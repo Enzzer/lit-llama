@@ -20,6 +20,7 @@ import shutil
 import lightning as L
 import numpy as np
 import torch
+import wandb
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -30,7 +31,7 @@ from lit_llama.adapter import LLaMA, LLaMAConfig, mark_only_adapter_as_trainable
 from lit_llama.tokenizer import Tokenizer
 from scripts.prepare_alpaca import generate_prompt
 from lightning.fabric.strategies import DeepSpeedStrategy
-
+from tqdm import tqdm
 
 eval_interval = 600
 save_interval = 1000
@@ -58,10 +59,24 @@ ds_config = {
 
 
 def main(
-    data_dir: str = "data/alpaca", 
+    wandb_project: str,
+    wandb_experiment_name: str,
+    data_dir: str = "data/alpaca",
     pretrained_path: str = "checkpoints/lit-llama/7B/lit-llama.pth",
     out_dir: str = "out/adapter/alpaca",
 ):
+    wandb.init(
+        # Set the project where this run will be logged
+        project=wandb_project,
+        # We pass a run name (otherwise it’ll be randomly assigned, like sunshine-lollypop-10)
+        name=wandb_experiment_name,
+        # Track hyperparameters and run metadata
+        config={
+            "learning_rate": learning_rate,
+            "dataset": data_dir,
+            "epochs": num_epochs,
+        },
+    )
 
     fabric = L.Fabric(
         accelerator="cuda", 
@@ -118,13 +133,12 @@ def train(
     """
     step_count = 0
 
-    for iter_num in range(max_iters):
-
+    for iter_num in tqdm(range(max_iters)):
         if step_count <= warmup_steps:
             # linear warmup
             lr = learning_rate * step_count / warmup_steps
             for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
+                param_group["lr"] = lr
 
         t0 = time.time()
 
@@ -138,10 +152,11 @@ def train(
             optimizer.step()
             optimizer.zero_grad()
             step_count += 1
-                
+
             if step_count % eval_interval == 0:
                 val_loss = validate(fabric, model, val_data)
                 fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
+                wandb.log({"val_loss": val_loss})
                 fabric.barrier()
 
             if step_count % save_interval == 0:
@@ -151,7 +166,10 @@ def train(
 
         dt = time.time() - t0
         if iter_num % log_interval == 0:
-            fabric.print(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
+            fabric.print(
+                f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms"
+            )
+            wandb.log({"loss": loss.item()})
 
 
 def generate_response(model, instruction, input=""):
@@ -176,7 +194,7 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray) -> 
     fabric.print("Validating ...")
     model.eval()
     losses = torch.zeros(eval_iters)
-    for k in range(eval_iters):
+    for k in tqdm(range(eval_iters)):
         input_ids, targets = get_batch(fabric, val_data)
         logits = model(input_ids)
         loss = loss_fn(logits, targets)
